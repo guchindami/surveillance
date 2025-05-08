@@ -7,11 +7,20 @@ const basicAuth = require('express-basic-auth');
 const schedule = require('node-schedule');
 const sharp = require('sharp');
 const bodyParser = require('body-parser');
+const http = require('http');
 const app = express();
 const port = process.env.PORT || 3001;
 
 // Parse JSON request bodies
 app.use(bodyParser.json());
+
+// Configure proper HTTP headers for streaming
+app.use((req, res, next) => {
+  // Set proper keep-alive headers
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('Keep-Alive', 'timeout=120, max=1000');
+  next();
+});
 
 // Configuration
 const config = {
@@ -32,6 +41,13 @@ const config = {
     width: 320,
     height: 180,
     sampleRate: 2,
+  },
+  streaming: {
+    // Improved streaming configurations
+    maxStreamAge: 60 * 60 * 1000, // 1 hour max stream time
+    reconnectTimeout: 10000,      // 10 seconds to reconnect
+    heartbeatInterval: 30000,     // Send keepalive data every 30 seconds
+    bufferSize: 1024 * 512        // 512KB buffer size for streams
   }
 };
 
@@ -49,6 +65,8 @@ const state = {
   activeRecordings: new Map(),
   snapshotIntervals: new Map(),
   activeStreams: new Map(),
+  streamClients: new Map(), // Track clients for each stream
+  streamBuffers: new Map(), // Buffer recent stream data for reconnects
   ffmpegLogStream: fs.createWriteStream(path.join(__dirname, 'ffmpeg.log'), { flags: 'a' }),
   motionDetection: {
     lastFrame: null,
@@ -102,6 +120,120 @@ const cleanupMotionFiles = () => {
     });
   }
 };
+
+// Streaming management functions
+function createCircularBuffer(size) {
+  let buffer = Buffer.alloc(0);
+  
+  return {
+    write: (chunk) => {
+      // Add new chunk to buffer
+      const newBuffer = Buffer.concat([buffer, chunk]);
+      
+      // Keep only the most recent data up to size
+      if (newBuffer.length > size) {
+        buffer = newBuffer.slice(newBuffer.length - size);
+      } else {
+        buffer = newBuffer;
+      }
+    },
+    getBuffer: () => Buffer.from(buffer), // Return a copy of the buffer
+    clear: () => {
+      buffer = Buffer.alloc(0);
+    }
+  };
+}
+
+function getStreamKey(cameraId) {
+  return `stream_${cameraId}`;
+}
+
+function addStreamClient(streamKey, res) {
+  if (!state.streamClients.has(streamKey)) {
+    state.streamClients.set(streamKey, new Set());
+  }
+  state.streamClients.get(streamKey).add(res);
+  
+  // Set up heartbeat interval to prevent connection timeout
+  const heartbeatInterval = setInterval(() => {
+    if (res.writableEnded) {
+      clearInterval(heartbeatInterval);
+      return;
+    }
+    // Send small empty fragment to keep the connection alive
+    res.write('\r\n');
+  }, config.streaming.heartbeatInterval);
+  
+  // Clean up on client disconnect
+  res.on('close', () => {
+    clearInterval(heartbeatInterval);
+    if (state.streamClients.has(streamKey)) {
+      state.streamClients.get(streamKey).delete(res);
+      if (state.streamClients.get(streamKey).size === 0) {
+        // No clients left, check if we should stop the stream
+        const ffmpegProcess = state.activeStreams.get(streamKey);
+        if (ffmpegProcess) {
+          console.log(`No clients left for ${streamKey}, stopping stream`);
+          ffmpegProcess.kill('SIGTERM');
+          state.activeStreams.delete(streamKey);
+          
+          // Keep buffer for a while in case clients reconnect
+          setTimeout(() => {
+            if (!state.activeStreams.has(streamKey) && 
+                (!state.streamClients.has(streamKey) || state.streamClients.get(streamKey).size === 0)) {
+              console.log(`Clearing buffer for ${streamKey} - no reconnections`);
+              if (state.streamBuffers.has(streamKey)) {
+                state.streamBuffers.get(streamKey).clear();
+              }
+            }
+          }, config.streaming.reconnectTimeout);
+        }
+      }
+    }
+  });
+  
+  // Send initial buffer if exists (helpful for reconnects)
+  if (state.streamBuffers.has(streamKey)) {
+    const initialBuffer = state.streamBuffers.get(streamKey).getBuffer();
+    if (initialBuffer.length > 0) {
+      console.log(`Sending ${initialBuffer.length} bytes of buffered data for reconnection`);
+      res.write(initialBuffer);
+    }
+  }
+  
+  return {
+    remove: () => {
+      if (state.streamClients.has(streamKey)) {
+        state.streamClients.get(streamKey).delete(res);
+      }
+    }
+  };
+}
+
+function broadcastToStreamClients(streamKey, chunk) {
+  if (!state.streamClients.has(streamKey)) return;
+  
+  // Store in buffer for reconnects
+  if (!state.streamBuffers.has(streamKey)) {
+    state.streamBuffers.set(streamKey, createCircularBuffer(config.streaming.bufferSize));
+  }
+  state.streamBuffers.get(streamKey).write(chunk);
+  
+  // Send to all connected clients
+  state.streamClients.get(streamKey).forEach(res => {
+    try {
+      if (!res.writableEnded) {
+        res.write(chunk);
+      } else {
+        // Remove if connection is closed
+        state.streamClients.get(streamKey).delete(res);
+      }
+    } catch (error) {
+      console.error(`Error sending stream data:`, error);
+      state.streamClients.get(streamKey).delete(res);
+    }
+  });
+}
 
 // FFmpeg process management
 class FFmpegManager {
@@ -173,22 +305,100 @@ class FFmpegManager {
   }
 
   static createStream(cameraId) {
+    const streamKey = getStreamKey(cameraId);
+    
+    // Return existing stream if already running
+    if (state.activeStreams.has(streamKey)) {
+      return state.activeStreams.get(streamKey);
+    }
+    
     try {
+      // Improved FFmpeg arguments for better streaming
       const args = [
         '-rtsp_transport', 'tcp',
         '-i', cameraConfig[cameraId],
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-f', 'mpegts',
-        '-'
+        '-fflags', 'nobuffer',         // Reduce buffering
+        '-flags', 'low_delay',         // Prioritize low latency
+        '-probesize', '32000',         // Smaller probe size for faster start
+        '-analyzeduration', '0',       // Reduce analysis time
+        '-c:v', 'libx264',             // Use H.264 codec
+        '-preset', 'ultrafast',        // Fastest encoding
+        '-tune', 'zerolatency',        // Optimize for streaming
+        '-x264opts', 'no-scenecut',    // Avoid keyframe insertions that cause buffering
+        '-g', '15',                    // Keyframe every 15 frames
+        '-keyint_min', '15',           // Minimum keyframe interval
+        '-crf', '30',                  // Balance quality/size, higher value = smaller size
+        '-pix_fmt', 'yuv420p',         // Standard pixel format
+        '-profile:v', 'baseline',      // Most compatible profile
+        '-level', '3.0',               // Compatibility level
+        '-f', 'mpegts',                // Use MPEG-TS format for better chunking
+        '-flush_packets', '1',         // Force packet flushing
+        '-'                            // Output to stdout
       ];
+      
+      if (cameraId === "360") {
+        args.splice(args.indexOf('-c:v') + 2, 0, 
+          '-vf', 'scale=896:512:force_original_aspect_ratio=decrease',
+          '-b:v', '256k',
+          '-bufsize', '1024k',
+          '-maxrate', '256k'
+        );
+      } else {
+        args.splice(args.indexOf('-c:v') + 2, 0,
+          '-vf', 'scale=640:480:force_original_aspect_ratio=decrease',
+          '-b:v', '256k', 
+          '-bufsize', '1024k',
+          '-maxrate', '256k'
+        );
+      }
+      
+      console.log(`Starting stream for ${cameraId} with key ${streamKey}`);
+      
       const process = spawn(config.ffmpegPath, args);
+      state.activeStreams.set(streamKey, process);
+      
+      // Create buffer for this stream if it doesn't exist
+      if (!state.streamBuffers.has(streamKey)) {
+        state.streamBuffers.set(streamKey, createCircularBuffer(config.streaming.bufferSize));
+      }
+      
+      // Handle stdout data
+      process.stdout.on('data', (chunk) => {
+        broadcastToStreamClients(streamKey, chunk);
+      });
+      
+      // Log errors but don't crash
+      process.stderr.on('data', (data) => {
+        const errStr = data.toString();
+        // Only log critical errors to avoid filling logs
+        if (errStr.includes('Error') || errStr.includes('Invalid') || errStr.includes('Failed')) {
+          console.error(`Stream error for ${cameraId}:`, errStr);
+        }
+      });
       
       process.on('error', err => {
         console.error(`Stream process error for ${cameraId}:`, err);
-        if (state.activeStreams.has(cameraId)) {
-          state.activeStreams.delete(cameraId);
+        state.activeStreams.delete(streamKey);
+      });
+      
+      // Auto-cleanup after max stream age
+      const streamTimeout = setTimeout(() => {
+        if (state.activeStreams.has(streamKey)) {
+          console.log(`Stream ${streamKey} reached max age, restarting...`);
+          process.kill('SIGTERM');
+          state.activeStreams.delete(streamKey);
+          
+          // Only restart if there are still clients
+          if (state.streamClients.has(streamKey) && state.streamClients.get(streamKey).size > 0) {
+            FFmpegManager.createStream(cameraId);
+          }
         }
+      }, config.streaming.maxStreamAge);
+      
+      process.on('close', (code) => {
+        console.log(`Stream process for ${cameraId} closed with code ${code}`);
+        clearTimeout(streamTimeout);
+        state.activeStreams.delete(streamKey);
       });
       
       return process;
@@ -510,84 +720,40 @@ function startMotionDetectionLoop() {
 // API Endpoints
 app.get("/stream", (req, res) => {
   const cameraId = safeCameraId(req.query.camera || "360");
+  const streamKey = getStreamKey(cameraId);
   
-  let ffmpegArgs = [
-    "-rtsp_transport", "tcp",
-    "-i", cameraConfig[cameraId],
-    "-fflags", "nobuffer",
-    "-flags", "low_delay",
-    "-c:v", "libx264",
-    "-preset", "ultrafast",
-    "-tune", "zerolatency",
-    "-crf", "23",
-    "-f", "mp4",
-    "-movflags", "frag_keyframe+empty_moov+faststart",
-    "-vf", "scale=640:360",
-    "-b:v", "256k",
-    "-bufsize", "512k",
-    "-threads", "2",
-    "-"
-  ];
-
-  if (cameraId === "360") {
-    ffmpegArgs = [
-      "-rtsp_transport", "tcp",
-      "-i", cameraConfig[cameraId],
-      "-fflags", "nobuffer",
-      "-flags", "low_delay",
-      "-c:v", "libx264",
-      "-preset", "ultrafast",
-      "-tune", "zerolatency",
-      "-crf", "20",
-      "-vf", "scale=896:512:force_original_aspect_ratio=decrease",
-      "-b:v", "256k",
-      "-bufsize", "512k",
-      "-r", "10",
-      "-g", "40",
-      "-f", "mp4",
-      "-movflags", "frag_keyframe+empty_moov+faststart",
-      "-threads", "8",
-      "-"
-    ];
-  }
+  // Set proper headers for streaming
+  res.setHeader("Content-Type", "video/mp2t");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Keep-Alive", "timeout=120, max=1000");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Transfer-Encoding", "chunked");
+  
+  console.log(`Stream requested for ${cameraId}`);
   
   try {
-    const ffmpeg = spawn(config.ffmpegPath, ffmpegArgs);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Transfer-Encoding", "chunked");
+    // Start stream if not already running
+    let ffmpegProcess = state.activeStreams.get(streamKey);
+    if (!ffmpegProcess) {
+      ffmpegProcess = FFmpegManager.createStream(cameraId);
+    }
     
-    const streamId = `${cameraId}_${Date.now()}`;
-    state.activeStreams.set(streamId, ffmpeg);
+    if (!ffmpegProcess) {
+      console.error(`Failed to create stream for ${cameraId}`);
+      return res.status(500).send("Failed to create stream");
+    }
     
-    ffmpeg.stdout.pipe(res);
-
-    ffmpeg.stderr.on("data", (err) => {
-      console.error(`FFmpeg stream error for ${cameraId}:`, err.toString());
-    });
-
-    ffmpeg.on("error", (err) => {
-      console.error(`Stream process error for ${cameraId}:`, err.toString());
-      state.activeStreams.delete(streamId);
-      res.status(500).end();
-    });
-
-    req.on("close", () => {
-      ffmpeg.kill();
-      state.activeStreams.delete(streamId);
+    // Add this response to stream clients
+    addStreamClient(streamKey, res);
+    
+    // Handle request close/error
+    res.on("error", (err) => {
+      console.error(`Client error for ${cameraId}:`, err);
     });
     
-    const timeout = setTimeout(() => {
-      if (state.activeStreams.has(streamId)) {
-        ffmpeg.kill();
-        state.activeStreams.delete(streamId);
-      }
-    }, 60 * 60 * 1000);
-    
-    req.on("close", () => {
-      clearTimeout(timeout);
-    });
   } catch (error) {
-    console.error(`Error creating stream for ${cameraId}:`, error);
+    console.error(`Error handling stream request for ${cameraId}:`, error);
     res.status(500).send("Error creating stream");
   }
 });
