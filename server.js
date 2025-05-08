@@ -521,7 +521,7 @@ app.get("/stream", (req, res) => {
     "-tune", "zerolatency",
     "-crf", "23",
     "-f", "mp4",
-    "-movflags", "frag_keyframe+empty_moov",
+    "-movflags", "frag_keyframe+empty_moov+faststart",
     "-vf", "scale=640:360",
     "-b:v", "256k",
     "-bufsize", "512k",
@@ -545,7 +545,7 @@ app.get("/stream", (req, res) => {
       "-r", "10",
       "-g", "40",
       "-f", "mp4",
-      "-movflags", "frag_keyframe+empty_moov",
+      "-movflags", "frag_keyframe+empty_moov+faststart",
       "-threads", "8",
       "-"
     ];
